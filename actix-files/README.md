@@ -7,3 +7,23 @@
 * [Chat on gitter](https://gitter.im/actix/actix)
 * Cargo package: [actix-files](https://crates.io/crates/actix-files)
 * Minimum supported Rust version: 1.33 or later
+
+
+## Added buffer function
+
+### Example ###
+Call .buffer(), which will activate the buffering functions for all 
+```
+use actix_files as fs;
+use actix_web::{App, HttpServer};
+
+pub fn main() {
+    HttpServer::new(|| {
+        App::new().service(fs::Files::new("/assets", "/buffered_files_folder").show_files_listing().buffer())
+    })
+    .bind("127.0.0.1:8088")
+    .unwrap()
+    .run()
+    .unwrap();
+}
+```

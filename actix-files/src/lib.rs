@@ -6,6 +6,9 @@ use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::{cmp, io};
+use std::collections::HashMap;
+use std::fs;
+use glob::glob;
 
 use actix_service::boxed::{self, BoxedNewService, BoxedService};
 use actix_service::{IntoNewService, NewService, Service};
@@ -14,7 +17,8 @@ use actix_web::dev::{
     ServiceResponse,
 };
 use actix_web::error::{BlockingError, Error, ErrorInternalServerError};
-use actix_web::http::header::DispositionType;
+use actix_web::http::{StatusCode};
+use actix_web::http::header::{ContentDisposition, DispositionParam, DispositionType};
 use actix_web::{web, FromRequest, HttpRequest, HttpResponse, Responder};
 use bytes::Bytes;
 use futures::future::{ok, Either, FutureResult};
@@ -27,10 +31,12 @@ use v_htmlescape::escape as escape_html_entity;
 mod error;
 mod named;
 mod range;
+mod buffered;
 
 use self::error::{FilesError, UriSegmentError};
 pub use crate::named::NamedFile;
 pub use crate::range::HttpRange;
+pub use crate::buffered::BufferedFile;
 
 type HttpService = BoxedService<ServiceRequest, ServiceResponse, Error>;
 type HttpNewService = BoxedNewService<(), ServiceRequest, ServiceResponse, Error, ()>;
@@ -84,7 +90,7 @@ impl Stream for ChunkedReadFile {
         let counter = self.counter;
 
         if size == counter {
-            Ok(Async::Ready(None))
+            Ok(Async::Ready(None)) // Read(None) actually determins the end of the stream?
         } else {
             let mut file = self.file.take().expect("Use after completion");
             self.fut = Some(Box::new(web::block(move || {
@@ -233,6 +239,7 @@ pub struct Files {
     renderer: Rc<DirectoryRenderer>,
     mime_override: Option<Rc<MimeOverride>>,
     file_flags: named::Flags,
+    buffered_files: HashMap<String, BufferedFile>,
 }
 
 impl Clone for Files {
@@ -246,6 +253,7 @@ impl Clone for Files {
             file_flags: self.file_flags,
             path: self.path.clone(),
             mime_override: self.mime_override.clone(),
+            buffered_files: self.buffered_files.clone(),
         }
     }
 }
@@ -271,7 +279,74 @@ impl Files {
             renderer: Rc::new(directory_listing),
             mime_override: None,
             file_flags: named::Flags::default(),
+            buffered_files: HashMap::new(),
         }
+    }
+
+    /// Load all files into buffer HashMap
+    pub fn buffer(mut self) -> Self {
+        
+        for entry in glob(&format!("{}/**/*", self.directory.display())).expect("Failed to read glob pattern") {
+            match entry {
+                Ok(path) => {
+                    println!("glob file: {:?}", path.display());
+                    let path_string = path.canonicalize().unwrap().to_str().unwrap().to_owned(); // use always canonicalized path
+                    let metadata = fs::metadata(&path);
+                    match metadata {
+                        Ok(md) => {
+                            // TODO: Better Option and Error checking
+
+                            // last modified, what for?
+                            //let last_modified = md.modified().unwrap().elapsed().unwrap().as_secs();
+
+                            log::debug!("path_string: {} (is_file: {})", path_string, md.is_file());
+                            if md.is_file() {
+                                // Content
+                                let mut buf = Vec::new();
+                                File::open(&path_string).unwrap().read_to_end(&mut buf).unwrap();
+
+                                // MIME 
+                                let ct = mime_guess::guess_mime_type(&path);
+                                let disposition_type = match ct.type_() {
+                                    mime::IMAGE | mime::TEXT | mime::VIDEO => DispositionType::Inline,
+                                    _ => DispositionType::Attachment,
+                                };
+
+                                // ContentDisposition
+                                let cd = ContentDisposition {
+                                    disposition: disposition_type,
+                                    parameters: vec![DispositionParam::Filename(path.file_name().unwrap().to_string_lossy().into_owned())],
+                                };
+
+                                // Push BufferdFile to HashMap
+                                self.buffered_files.insert(path_string.clone(), BufferedFile {
+                                    path: PathBuf::from(&path_string),
+                                    content: buf,
+                                    etag: None,
+
+                                    content_type: ct,
+                                    content_disposition: cd,
+                                    md: md.clone(),
+                                    modified: md.modified().ok(),
+                                    encoding: None,
+                                    status_code: StatusCode::OK,
+                                    flags: self.file_flags,
+                                });
+
+                                // Assign ETAG 
+                                // TODO: make it nicer. feels crapy
+                                let bf = self.buffered_files.get_mut(&path_string).unwrap();
+                                let etag = BufferedFile::make_etag(bf);
+                                bf.etag = etag;
+                            } 
+                        },
+                        Err(e) => println!("buffer file error: {}", e)
+                    }
+                },
+                Err(e) => println!("{:?}", e),
+            }
+        }
+        self
     }
 
     /// Show files listing for directories.
@@ -381,6 +456,7 @@ impl NewService for Files {
             renderer: self.renderer.clone(),
             mime_override: self.mime_override.clone(),
             file_flags: self.file_flags,
+            buffered_files: self.buffered_files.clone(),
         };
 
         if let Some(ref default) = *self.default.borrow() {
@@ -407,6 +483,7 @@ pub struct FilesService {
     renderer: Rc<DirectoryRenderer>,
     mime_override: Option<Rc<MimeOverride>>,
     file_flags: named::Flags,
+    buffered_files: HashMap<String, BufferedFile>,
 }
 
 impl FilesService {
@@ -490,24 +567,46 @@ impl Service for FilesService {
                 )))
             }
         } else {
-            match NamedFile::open(path) {
-                Ok(mut named_file) => {
-                    if let Some(ref mime_override) = self.mime_override {
-                        let new_disposition =
-                            mime_override(&named_file.content_type.type_());
-                        named_file.content_disposition.disposition = new_disposition;
-                    }
 
-                    named_file.flags = self.file_flags;
-                    let (req, _) = req.into_parts();
-                    match named_file.respond_to(&req) {
-                        Ok(item) => {
-                            Either::A(ok(ServiceResponse::new(req.clone(), item)))
+            if self.file_flags.contains(named::Flags::BUFFERED) {
+
+                // Load BufferedFile
+                match self.buffered_files.get(path.to_str().unwrap()) {
+                    Some(buffered_file) => {
+                        let (req, _) = req.into_parts();
+
+                        let buffered_file = buffered_file.clone(); // Can't consume buffered_file
+
+                        match buffered_file.respond_to(&req) {
+                            Ok(item) => {
+                                Either::A(ok(ServiceResponse::new(req.clone(), item)))
+                            }
+                            Err(e) => Either::A(ok(ServiceResponse::from_err(e, req))),
                         }
-                        Err(e) => Either::A(ok(ServiceResponse::from_err(e, req))),
                     }
+                    None => self.handle_err(io::Error::new(io::ErrorKind::NotFound, "File not found"), req)
                 }
-                Err(e) => self.handle_err(e, req),
+
+            } else {
+                match NamedFile::open(path) {
+                    Ok(mut named_file) => {
+                        if let Some(ref mime_override) = self.mime_override {
+                            let new_disposition =
+                                mime_override(&named_file.content_type.type_());
+                            named_file.content_disposition.disposition = new_disposition;
+                        }
+
+                        named_file.flags = self.file_flags;
+                        let (req, _) = req.into_parts();
+                        match named_file.respond_to(&req) {
+                            Ok(item) => {
+                                Either::A(ok(ServiceResponse::new(req.clone(), item)))
+                            }
+                            Err(e) => Either::A(ok(ServiceResponse::from_err(e, req))),
+                        }
+                    }
+                    Err(e) => self.handle_err(e, req),
+                }
             }
         }
     }
@@ -855,7 +954,7 @@ mod tests {
 
     #[test]
     fn test_named_file_content_length_headers() {
-        use actix_web::body::{MessageBody, ResponseBody};
+        // use actix_web::body::{MessageBody, ResponseBody}; // not needed yet
 
         let mut srv = test::init_service(
             App::new().service(Files::new("test", ".").index_file("tests/test.binary")),

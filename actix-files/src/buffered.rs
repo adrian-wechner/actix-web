@@ -1,158 +1,37 @@
-use std::fs::{File, Metadata};
-use std::io;
-use std::ops::{Deref, DerefMut};
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-#[cfg(unix)]
+use std::fs;
 use std::os::unix::fs::MetadataExt;
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
+use futures::{Future, Async, Poll, Stream};
+use bytes::Bytes;
+use std::{io, cmp};
 
-use bitflags::bitflags;
-use mime;
-use mime_guess::guess_mime_type;
-
-use actix_http::body::SizedStream;
-use actix_web::http::header::{
-    self, ContentDisposition, DispositionParam, DispositionType,
-};
+use actix_web::http::header::{self, EntityTag};
 use actix_web::http::{ContentEncoding, Method, StatusCode};
 use actix_web::middleware::BodyEncoding;
-use actix_web::{Error, HttpMessage, HttpRequest, HttpResponse, Responder};
+use actix_web::{web, Error, HttpResponse, Responder, HttpMessage, HttpRequest};
+use actix_http::body::SizedStream;
+use actix_web::error::{BlockingError, ErrorInternalServerError};
 
 use crate::range::HttpRange;
-use crate::ChunkedReadFile;
+use crate::named;
 
-bitflags! {
-    pub(crate) struct Flags: u32 {
-        const ETAG =     0b00000001;
-        const LAST_MD =  0b00000010;
-        const BUFFERED = 0b00000100;
-    }
+#[derive(Clone)]
+pub struct BufferedFile {
+    pub(crate) path: PathBuf, // Memorize original Path
+    pub(crate) content: Vec<u8>, // Buffer Content
+    pub(crate) etag: Option<EntityTag>, // Buffer ETAG
+
+    pub(crate) content_type: mime::Mime, // same as in NamedFile
+    pub(crate) content_disposition: header::ContentDisposition, // same as in NamedFile
+    pub(crate) md: fs::Metadata, // same as in NamedFile
+    pub modified: Option<SystemTime>, // same as in NamedFile
+    pub(crate) encoding: Option<ContentEncoding>, // same as in NamedFile
+    pub(crate) status_code: StatusCode, // same as in NamedFile
+    pub(crate) flags: named::Flags, // same as in NamedFile
 }
 
-impl Default for Flags {
-    fn default() -> Self {
-        Flags::all()
-    }
-}
-
-/// A file with an associated name.
-#[derive(Debug)]
-pub struct NamedFile {
-    path: PathBuf,
-    file: File,
-    pub(crate) content_type: mime::Mime,
-    pub(crate) content_disposition: header::ContentDisposition,
-    pub(crate) md: Metadata,
-    modified: Option<SystemTime>,
-    pub(crate) encoding: Option<ContentEncoding>,
-    pub(crate) status_code: StatusCode,
-    pub(crate) flags: Flags,
-}
-
-impl NamedFile {
-    /// Creates an instance from a previously opened file.
-    ///
-    /// The given `path` need not exist and is only used to determine the `ContentType` and
-    /// `ContentDisposition` headers.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use actix_files::NamedFile;
-    /// use std::io::{self, Write};
-    /// use std::env;
-    /// use std::fs::File;
-    ///
-    /// fn main() -> io::Result<()> {
-    ///     let mut file = File::create("foo.txt")?;
-    ///     file.write_all(b"Hello, world!")?;
-    ///     let named_file = NamedFile::from_file(file, "bar.txt")?;
-    ///     # std::fs::remove_file("foo.txt");
-    ///     Ok(())
-    /// }
-    /// ```
-    pub fn from_file<P: AsRef<Path>>(file: File, path: P) -> io::Result<NamedFile> {
-        let path = path.as_ref().to_path_buf();
-
-        // Get the name of the file and use it to construct default Content-Type
-        // and Content-Disposition values
-        let (content_type, content_disposition) = {
-            let filename = match path.file_name() {
-                Some(name) => name.to_string_lossy(),
-                None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "Provided path has no filename",
-                    ));
-                }
-            };
-
-            let ct = guess_mime_type(&path);
-            let disposition_type = match ct.type_() {
-                mime::IMAGE | mime::TEXT | mime::VIDEO => DispositionType::Inline,
-                _ => DispositionType::Attachment,
-            };
-            let cd = ContentDisposition {
-                disposition: disposition_type,
-                parameters: vec![DispositionParam::Filename(filename.into_owned())],
-            };
-            (ct, cd)
-        };
-
-        let md = file.metadata()?;
-        let modified = md.modified().ok();
-        let encoding = None;
-        Ok(NamedFile {
-            path,
-            file,
-            content_type,
-            content_disposition,
-            md,
-            modified,
-            encoding,
-            status_code: StatusCode::OK,
-            flags: Flags::default(),
-        })
-    }
-
-    /// Attempts to open a file in read-only mode.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use actix_files::NamedFile;
-    ///
-    /// let file = NamedFile::open("foo.txt");
-    /// ```
-    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<NamedFile> {
-        Self::from_file(File::open(&path)?, path)
-    }
-
-    /// Returns reference to the underlying `File` object.
-    #[inline]
-    pub fn file(&self) -> &File {
-        &self.file
-    }
-
-    /// Retrieve the path of this file.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// # use std::io;
-    /// use actix_files::NamedFile;
-    ///
-    /// # fn path() -> io::Result<()> {
-    /// let file = NamedFile::open("test.txt")?;
-    /// assert_eq!(file.path().as_os_str(), "foo.txt");
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[inline]
-    pub fn path(&self) -> &Path {
-        self.path.as_path()
-    }
+impl BufferedFile {
 
     /// Set response **Status Code**
     pub fn set_status_code(mut self, status: StatusCode) -> Self {
@@ -193,7 +72,7 @@ impl NamedFile {
     ///
     ///Default is true.
     pub fn use_etag(mut self, value: bool) -> Self {
-        self.flags.set(Flags::ETAG, value);
+        self.flags.set(named::Flags::ETAG, value);
         self
     }
 
@@ -202,17 +81,28 @@ impl NamedFile {
     ///
     ///Default is true.
     pub fn use_last_modified(mut self, value: bool) -> Self {
-        self.flags.set(Flags::LAST_MD, value);
+        self.flags.set(named::Flags::LAST_MD, value);
         self
     }
 
-    pub(crate) fn etag(&self) -> Option<header::EntityTag> {
+    pub(crate) fn last_modified(&self) -> Option<header::HttpDate> {
+        self.modified.map(|mtime| mtime.into())
+    }
+
+    /// Re-Buffer BufferedFile
+    /// TODO
+    pub fn buffer(&mut self) -> &Self {
+        println!("Re-Buffer self: {}", self.path.display());
+        self
+    }
+
+    pub(crate) fn make_etag(bf: &mut BufferedFile) -> Option<EntityTag> {
         // This etag format is similar to Apache's.
-        self.modified.as_ref().map(|mtime| {
+        bf.modified.as_ref().map(|mtime| {
             let ino = {
                 #[cfg(unix)]
                 {
-                    self.md.ino()
+                    bf.md.ino()
                 }
                 #[cfg(not(unix))]
                 {
@@ -226,72 +116,22 @@ impl NamedFile {
             header::EntityTag::strong(format!(
                 "{:x}:{:x}:{:x}:{:x}",
                 ino,
-                self.md.len(),
+                bf.md.len(),
                 dur.as_secs(),
                 dur.subsec_nanos()
             ))
         })
     }
-
-    pub(crate) fn last_modified(&self) -> Option<header::HttpDate> {
-        self.modified.map(|mtime| mtime.into())
-    }
 }
 
-impl Deref for NamedFile {
-    type Target = File;
-
-    fn deref(&self) -> &File {
-        &self.file
-    }
-}
-
-impl DerefMut for NamedFile {
-    fn deref_mut(&mut self) -> &mut File {
-        &mut self.file
-    }
-}
-
-/// Returns true if `req` has no `If-Match` header or one which matches `etag`.
-fn any_match(etag: Option<&header::EntityTag>, req: &HttpRequest) -> bool {
-    match req.get_header::<header::IfMatch>() {
-        None | Some(header::IfMatch::Any) => true,
-        Some(header::IfMatch::Items(ref items)) => {
-            if let Some(some_etag) = etag {
-                for item in items {
-                    if item.strong_eq(some_etag) {
-                        return true;
-                    }
-                }
-            }
-            false
-        }
-    }
-}
-
-/// Returns true if `req` doesn't have an `If-None-Match` header matching `req`.
-fn none_match(etag: Option<&header::EntityTag>, req: &HttpRequest) -> bool {
-    match req.get_header::<header::IfNoneMatch>() {
-        Some(header::IfNoneMatch::Any) => false,
-        Some(header::IfNoneMatch::Items(ref items)) => {
-            if let Some(some_etag) = etag {
-                for item in items {
-                    if item.weak_eq(some_etag) {
-                        return false;
-                    }
-                }
-            }
-            true
-        }
-        None => true,
-    }
-}
-
-impl Responder for NamedFile {
+impl Responder for BufferedFile {
     type Error = Error;
     type Future = Result<HttpResponse, Error>;
 
     fn respond_to(self, req: &HttpRequest) -> Self::Future {
+
+        // Check for non-200 Status Code
+        // If not OK then steam back complete file
         if self.status_code != StatusCode::OK {
             let mut resp = HttpResponse::build(self.status_code);
             resp.set(header::ContentType(self.content_type.clone()))
@@ -305,13 +145,15 @@ impl Responder for NamedFile {
             let reader = ChunkedReadFile {
                 size: self.md.len(),
                 offset: 0,
-                file: Some(self.file),
-                fut: None,
+                content: self.content.clone(),
                 counter: 0,
+                fut: None,
             };
             return Ok(resp.streaming(reader));
         }
 
+        // Check for correct HEADER Method
+        // At wrong header, anser back with MethodNotAllowed 405
         match req.method() {
             &Method::HEAD | &Method::GET => (),
             _ => {
@@ -322,19 +164,15 @@ impl Responder for NamedFile {
             }
         }
 
-        let etag = if self.flags.contains(Flags::ETAG) {
-            self.etag()
-        } else {
-            None
-        };
-        let last_modified = if self.flags.contains(Flags::LAST_MD) {
+        let last_modified = if self.flags.contains(named::Flags::LAST_MD) {
             self.last_modified()
         } else {
             None
         };
 
         // check preconditions
-        let precondition_failed = if !any_match(etag.as_ref(), req) {
+        // precondition_failed: there is no
+        let precondition_failed = if !any_match(self.etag.as_ref(), req) {
             true
         } else if let (Some(ref m), Some(header::IfUnmodifiedSince(ref since))) =
             (last_modified, req.get_header())
@@ -350,7 +188,7 @@ impl Responder for NamedFile {
         };
 
         // check last modified
-        let not_modified = if !none_match(etag.as_ref(), req) {
+        let not_modified = if !none_match(self.etag.as_ref(), req) {
             true
         } else if req.headers().contains_key(&header::IF_NONE_MATCH) {
             false
@@ -381,7 +219,7 @@ impl Responder for NamedFile {
         resp.if_some(last_modified, |lm, resp| {
             resp.set(header::LastModified(lm));
         })
-        .if_some(etag, |etag, resp| {
+        .if_some(self.etag, |etag, resp| {
             resp.set(header::ETag(etag));
         });
 
@@ -424,13 +262,114 @@ impl Responder for NamedFile {
         let reader = ChunkedReadFile {
             offset,
             size: length,
-            file: Some(self.file),
-            fut: None,
+            content: self.content.clone(),
             counter: 0,
+            fut: None,
         };
         if offset != 0 || length != self.md.len() {
             return Ok(resp.status(StatusCode::PARTIAL_CONTENT).streaming(reader));
         };
         Ok(resp.body(SizedStream::new(length, reader)))
+    }
+}
+
+/// Returns true if `req` has no `If-Match` header or one which matches `etag`.
+fn any_match(etag: Option<&header::EntityTag>, req: &HttpRequest) -> bool {
+    match req.get_header::<header::IfMatch>() {
+        None | Some(header::IfMatch::Any) => true,
+        Some(header::IfMatch::Items(ref items)) => {
+            if let Some(some_etag) = etag {
+                for item in items {
+                    if item.strong_eq(some_etag) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+    }
+}
+
+/// Returns true if `req` doesn't have an `If-None-Match` header matching `req`.
+fn none_match(etag: Option<&header::EntityTag>, req: &HttpRequest) -> bool {
+    match req.get_header::<header::IfNoneMatch>() {
+        Some(header::IfNoneMatch::Any) => false,
+        Some(header::IfNoneMatch::Items(ref items)) => {
+            if let Some(some_etag) = etag {
+                for item in items {
+                    if item.weak_eq(some_etag) {
+                        return false;
+                    }
+                }
+            }
+            true
+        }
+        None => true,
+    }
+}
+
+/// Stream struct
+pub struct ChunkedReadFile {
+    size: u64,
+    offset: u64,
+    content: Vec<u8>,
+    fut: Option<Box<Future<Item = (Bytes), Error = BlockingError<io::Error>>>>,
+    counter: u64,
+}
+
+fn handle_error(err: BlockingError<io::Error>) -> Error {
+    match err {
+        BlockingError::Error(err) => err.into(),
+        BlockingError::Canceled => ErrorInternalServerError("Unexpected error").into(),
+    }
+}
+
+impl Stream for ChunkedReadFile {
+    type Item = Bytes;
+    type Error = Error;
+
+    fn poll(&mut self) -> Poll<Option<Bytes>, Error> {
+        if self.fut.is_some() {
+            return match self.fut.as_mut().unwrap().poll().map_err(handle_error)? {
+                Async::Ready(bytes) => {
+                    self.fut.take();
+                    self.offset += bytes.len() as u64;
+                    self.counter += bytes.len() as u64;
+                    Ok(Async::Ready(Some(bytes)))
+                }
+                Async::NotReady => Ok(Async::NotReady),
+            };
+        }
+
+        let size = self.size as usize;
+        let offset = self.offset as usize;
+        let counter = self.counter as usize;
+        
+
+        if size == counter {
+            Ok(Async::Ready(None)) // ??? Ready(None) actually determins the end of the stream ???
+        } else {
+
+            let max_bytes: usize = cmp::min(size.saturating_sub(counter), 65_536) as usize;
+            let mut buf = vec![0; max_bytes]; //Vec::with_capacity(max_bytes);
+            let content_len = self.content.len();
+
+            // Make sure not accessing Vec out of range
+            if !(offset + size > content_len) {
+                //log::debug!("### COPY ### Buf Capacity: {} content Capacity: {}", buf.capacity(), self.content.capacity());
+                buf.copy_from_slice(&self.content[offset..=(offset + max_bytes - 1)]);
+            }
+
+            self.fut = Some(Box::new(web::block(move || {
+                
+                // Make sure not accessing Vec out of range
+                if offset + size > content_len {
+                    return Err(io::ErrorKind::UnexpectedEof.into());
+                } 
+
+                Ok(Bytes::from(buf))
+            })));
+            self.poll()
+        }
     }
 }
